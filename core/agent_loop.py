@@ -1,4 +1,15 @@
 # Core: Unified Agent Loop
+# ========================
+# 架构原则：
+#   主循环只做三件事：API调用 -> 处理工具调用 -> 处理最终文本
+#   所有能力通过注册表接入，主循环不知道具体是谁
+#   控制面（权限/钩子）作为中间件在工具执行前后拦截
+#
+# 边界定义：
+#   1. ControlPlane   — pre/post 拦截点，权限判断，钩子触发
+#   2. ToolRouter     — 分发工具，零 if，靠注册表驱动
+#   3. EventSources   — cron / background / message_bus 视为外部事件，主循环只 drain 并注入 history
+
 from __future__ import annotations
 
 import json
@@ -10,376 +21,393 @@ from pathlib import Path
 from typing import Any, Optional
 
 from dotenv import load_dotenv
-load_dotenv(dotenv_path=r"C:\Users\10621\Desktop\code_source\agent_code\.env", override=True)          # 加载 .env，覆盖系统默认
+load_dotenv(dotenv_path=DOTENV, override=True)
 
 from anthropic import Anthropic, APIError
-
 from infra.base import extract_text, normalize_messages, read_file, run_bash, write_file, edit_file
-from capabilities.compact import CompactState, compact_history, estimate_context_size, micro_compact, persist_large_output, track_recent_file
-from capabilities.hooks import HookManager
-from capabilities.memory import MemoryManager
-from capabilities.permissions import PermissionManager
-from capabilities.scheduler import CronScheduler
-from capabilities.skills import SkillRegistry
-from capabilities.tasks import TaskManager
-from capabilities.todo import TodoManager
-from capabilities.background import BackgroundManager
 
 
 # ---------------------------------------------------------------------------
-# Defaults
-# ---------------------------------------------------------------------------
-WORKDIR = Path(os.getenv("AGENT_WORKDIR", Path.cwd()))
-MODEL = os.getenv("MODEL_ID", "claude-sonnet-4-20250514")
-_ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL", "")
-_client = Anthropic(base_url=_ANTHROPIC_BASE_URL) if _ANTHROPIC_BASE_URL else Anthropic()
-
-
-# ---------------------------------------------------------------------------
-# Tool schemas
+# 1. 基础工具（固定不变，不走 if 分发）
 # ---------------------------------------------------------------------------
 BASE_TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
+    {"name": "bash",       "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
+    {"name": "read_file",  "description": "Read file contents.",
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
     {"name": "write_file", "description": "Write content to a file.",
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text in a file once.",
+    {"name": "edit_file",  "description": "Replace exact text in a file once.",
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
 ]
 
+def _base_read(args: dict, ctx: dict) -> str:
+    from capabilities.compact import track_recent_file, persist_large_output
+    path = args["path"]
+    if ctx.get("compact"):
+        track_recent_file(ctx["compact"], path)
+    content = read_file(path, ctx["workdir"], args.get("limit"))
+    if ctx.get("compact") and len(content) > 30000:
+        tag = "read_%d" % (hash(path) % 100000)
+        return persist_large_output(tag, content)
+    return content
 
-def build_tools(registry: "AgentRegistry") -> list[dict]:
-    """Build the full tool list based on enabled capabilities."""
-    tools = list(BASE_TOOLS)
-    if registry.skills:
-        tools.append({"name": "load_skill", "description": "Load the full body of a named skill into context.",
-                      "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}})
-    if registry.memory:
-        tools.append({"name": "save_memory", "description": "Save a persistent memory.",
-                      "input_schema": {"type": "object", "properties": {
-                          "name": {"type": "string"}, "description": {"type": "string"},
-                          "type": {"type": "string", "enum": ["user", "feedback", "project", "reference"]},
-                          "content": {"type": "string"}}, "required": ["name", "description", "type", "content"]}})
-    if registry.tasks:
-        tools.extend([
-            {"name": "task_create", "description": "Create a new task.",
-             "input_schema": {"type": "object", "properties": {"subject": {"type": "string"}, "description": {"type": "string"}}, "required": ["subject"]}},
-            {"name": "task_update", "description": "Update a task.",
-             "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "deleted"]}, "owner": {"type": "string"}}, "required": ["task_id"]}},
-            {"name": "task_list", "description": "List all tasks.",
-             "input_schema": {"type": "object", "properties": {}}},
-            {"name": "task_get", "description": "Get task by ID.",
-             "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
-        ])
-    if registry.cron:
-        tools.extend([
-            {"name": "cron_create", "description": "Schedule a recurring or one-shot task.",
-             "input_schema": {"type": "object", "properties": {"cron": {"type": "string"}, "prompt": {"type": "string"}, "recurring": {"type": "boolean"}, "durable": {"type": "boolean"}}, "required": ["cron", "prompt"]}},
-            {"name": "cron_delete", "description": "Delete a scheduled task.",
-             "input_schema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}},
-            {"name": "cron_list", "description": "List scheduled tasks.",
-             "input_schema": {"type": "object", "properties": {}}},
-        ])
-    if registry.background:
-        tools.extend([
-            {"name": "background_run", "description": "Run a command in background.",
-             "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-            {"name": "check_background", "description": "Check background task status.",
-             "input_schema": {"type": "object", "properties": {"task_id": {"type": "string"}}}},
-        ])
-    if registry.todo:
-        tools.append({"name": "plan_update", "description": "Update the session plan.",
-                       "input_schema": {"type": "object", "properties": {"items": {"type": "array"}}, "required": ["items"]}})
-    return tools
+BASE_HANDLERS = {
+    "bash":       lambda a, c: run_bash(a["command"], c["workdir"]),
+    "read_file":  _base_read,
+    "write_file": lambda a, c: write_file(a["path"], a["content"], c["workdir"]),
+    "edit_file":  lambda a, c: edit_file(a["path"], a["old_text"], a["new_text"], c["workdir"]),
+}
 
 
 # ---------------------------------------------------------------------------
-# Registry — holds all capability instances for a session
+# 2. 工具路由器 — 零 if，靠注册表分发
+# ---------------------------------------------------------------------------
+class ToolRouter:
+    def __init__(self):
+        self._handlers = {}
+        self._schemas  = {}
+
+    def register(self, name: str, handler: callable, schema: dict = None) -> None:
+        self._handlers[name] = handler
+        if schema:
+            self._schemas[name] = schema
+
+    def dispatch(self, name: str, args: dict, ctx: dict) -> str:
+        handler = self._handlers.get(name)
+        if handler is None:
+            return "Unknown tool: %s" % name
+        try:
+            return handler(args, ctx)
+        except Exception as e:
+            return "Tool error: %s" % e
+
+    def tools_for_llm(self) -> list:
+        return list(self._schemas.values()) if self._schemas else list(BASE_TOOLS)
+
+
+# ---------------------------------------------------------------------------
+# 3. 控制面 — pre / post 拦截点
+# ---------------------------------------------------------------------------
+class ControlPlane:
+    def __init__(self, router: ToolRouter):
+        self.router = router
+        self._perm = None
+        self._hooks = None
+
+    def set_permissions(self, mgr) -> None:
+        self._perm = mgr
+
+    def set_hooks(self, mgr) -> None:
+        self._hooks = mgr
+
+    def pre_tool(self, name: str, args: dict):
+        injected, blocked_reason = [], ""
+
+        if self._perm:
+            decision = self._perm.check(name, args)
+            if decision["behavior"] == "deny":
+                return PreResult(False, True, "Permission denied: %s" % decision["reason"], [])
+            if decision["behavior"] == "ask" and not self._perm.ask_user(name, args):
+                return PreResult(False, True, "Permission denied by user for %s" % name, [])
+
+        if self._hooks:
+            ctx = {"tool_name": name, "tool_input": args}
+            result = self._hooks.run_hooks("PreToolUse", ctx)
+            for msg in result.get("messages", []):
+                injected.append("[Hook]: %s" % msg)
+            if result.get("blocked"):
+                blocked_reason = result.get("block_reason", "blocked by hook")
+
+        if blocked_reason:
+            return PreResult(True, True, "Blocked: %s" % blocked_reason, injected)
+
+        return PreResult(True, False, None, injected)
+
+    def post_tool(self, name: str, args: dict, output: str) -> str:
+        if not self._hooks:
+            return output
+        ctx = {"tool_name": name, "tool_input": args, "tool_output": output}
+        result = self._hooks.run_hooks("PostToolUse", ctx)
+        for msg in result.get("messages", []):
+            output = "%s\n[Hook note]: %s" % (output, msg)
+        return output
+
+
+@dataclass
+class PreResult:
+    has_permission: bool
+    blocked: bool
+    output: Optional[str]
+    injected_messages: list = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# 4. 事件源接口
+# ---------------------------------------------------------------------------
+class EventSource:
+    def drain(self) -> list: return []
+
+
+class CronSource(EventSource):
+    def __init__(self, scheduler): self.scheduler = scheduler
+    def drain(self) -> list:
+        return [{"role": "user", "content": n} for n in self.scheduler.drain_notifications()]
+
+
+class BackgroundSource(EventSource):
+    def __init__(self, mgr): self.mgr = mgr
+    def drain(self) -> list:
+        return [{"role": "user", "content": "[bg:%s] %s: %s" % (n["task_id"], n["status"], n["preview"])}
+                for n in self.mgr.drain_notifications()]
+
+
+class InboxSource(EventSource):
+    def __init__(self, bus, agent_name: str = "lead"):
+        self.bus = bus; self.agent_name = agent_name
+    def drain(self) -> list:
+        return [{"role": "user", "content": "<inbox>%s</inbox>" % json.dumps(m)}
+                for m in self.bus.read_inbox(self.agent_name)]
+
+# ---------------------------------------------------------------------------
+# 5. AgentRegistry
 # ---------------------------------------------------------------------------
 @dataclass
 class AgentRegistry:
-    skills: Optional[SkillRegistry] = None
-    memory: Optional[MemoryManager] = None
-    tasks: Optional[TaskManager] = None
-    cron: Optional[CronScheduler] = None
-    background: Optional[BackgroundManager] = None
-    todo: Optional[TodoManager] = None
-    hooks: Optional[HookManager] = None
-    permissions: Optional[PermissionManager] = None
-    compact: Optional[CompactState] = None
-    worktrees: Optional[Any] = None  # WorktreeManager
-    message_bus: Optional[Any] = None  # MessageBus
-    skill_dir: Path = Path("skills")
-    memory_dir: Path = Path(".memory")
-    tasks_dir: Path = Path(".tasks")
-    workdir: Path = Path.cwd()
+    skills:      Optional[Any] = None
+    memory:      Optional[Any] = None
+    tasks:       Optional[Any] = None
+    cron:        Optional[Any] = None
+    background:  Optional[Any] = None
+    todo:        Optional[Any] = None
+    hooks:       Optional[Any] = None
+    permissions: Optional[Any] = None
+    compact:     Optional[Any] = None
+    worktrees:   Optional[Any] = None
+    message_bus: Optional[Any] = None
+    workdir:     Path = field(default_factory=Path.cwd)
 
 
 # ---------------------------------------------------------------------------
-# Tool execution
+# 6. AgentRunner
 # ---------------------------------------------------------------------------
-def execute_tool(name: str, args: dict, registry: AgentRegistry, tool_use_id: str = "") -> str:
-    # Base tools
-    if name == "bash":
-        return run_bash(args["command"], registry.workdir)
-    if name == "read_file":
-        p = args["path"]
-        if registry.compact:
-            track_recent_file(registry.compact, p)
-        content = read_file(p, registry.workdir, args.get("limit"))
-        if registry.compact and len(content) > 30000:
-            return persist_large_output(f"read_{hash(p) % 100000}", content)
-        return content
-    if name == "write_file":
-        return write_file(args["path"], args["content"], registry.workdir)
-    if name == "edit_file":
-        return edit_file(args["path"], args["old_text"], args["new_text"], registry.workdir)
+class AgentRunner:
+    def __init__(self, system_prompt: str, registry: AgentRegistry, max_tokens: int = 8000):
+        self.system_prompt = system_prompt
+        self.registry = registry
+        self.max_tokens = max_tokens
+        self.model = os.getenv("MODEL_ID", "claude-sonnet-4-20250514")
+        self.base_url = os.getenv("ANTHROPIC_BASE_URL", "")
+        self._client = Anthropic(base_url=self.base_url) if self.base_url else Anthropic()
+        self._compact_state = registry.compact
 
-    # Skills
-    if name == "load_skill" and registry.skills:
-        return registry.skills.load_full_text(args["name"])
+        self.router = ToolRouter()
+        self._register_base_tools()
+        self._register_capability_tools()
 
-    # Memory
-    if name == "save_memory" and registry.memory:
-        return registry.memory.save_memory(args["name"], args["description"], args["type"], args["content"])
+        self.plane = ControlPlane(self.router)
+        if registry.permissions: self.plane.set_permissions(registry.permissions)
+        if registry.hooks:       self.plane.set_hooks(registry.hooks)
 
-    # Tasks
-    if name == "task_create" and registry.tasks:
-        return registry.tasks.create(args["subject"], args.get("description", ""))
-    if name == "task_update" and registry.tasks:
-        return registry.tasks.update(args["task_id"], args.get("status"), args.get("owner"))
-    if name == "task_list" and registry.tasks:
-        return registry.tasks.list_all()
-    if name == "task_get" and registry.tasks:
-        return registry.tasks.get(args["task_id"])
+        self._sources = []
+        if registry.cron:        self._sources.append(CronSource(registry.cron))
+        if registry.background:  self._sources.append(BackgroundSource(registry.background))
+        if registry.message_bus: self._sources.append(InboxSource(registry.message_bus))
 
-    # Cron
-    if name == "cron_create" and registry.cron:
-        return registry.cron.create(args["cron"], args["prompt"],
-                                   args.get("recurring", True), args.get("durable", False))
-    if name == "cron_delete" and registry.cron:
-        return registry.cron.delete(args["id"])
-    if name == "cron_list" and registry.cron:
-        return registry.cron.list_tasks()
+        if registry.cron:   registry.cron.start()
+        if registry.memory: registry.memory.load_all()
 
-    # Background
-    if name == "background_run" and registry.background:
-        return registry.background.run(args["command"])
-    if name == "check_background" and registry.background:
-        return registry.background.check(args.get("task_id"))
+    def _register_base_tools(self) -> None:
+        for t in BASE_TOOLS:
+            self.router.register(t["name"], BASE_HANDLERS[t["name"]], schema=t)
 
-    # Todo
-    if name == "plan_update" and registry.todo:
-        return registry.todo.update(args["items"])
+    def _register_capability_tools(self) -> None:
+        r, reg = self.router, self.registry
 
-    return f"Unknown tool: {name}"
-
-
-# ---------------------------------------------------------------------------
-# Error recovery
-# ---------------------------------------------------------------------------
-MAX_RECOVERY_ATTEMPTS = 3
-BACKOFF_BASE_DELAY = 1.0
-BACKOFF_MAX_DELAY = 30.0
-TOKEN_THRESHOLD = 50000
-CONTINUATION_MESSAGE = (
-    "Output limit hit. Continue directly from where you stopped -- "
-    "no recap, no repetition."
+        if reg.skills:
+            r.register("load_skill",  lambda a, _: reg.skills.load_full_text(a["name"]),
+                        {"name": "load_skill", "description": "Load skill body.",
+                         "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}})
+            r.register("skills_list", lambda a, _: reg.skills.describe_available(),
+                        {"name": "skills_list", "description": "List skills.",
+                         "input_schema": {"type": "object", "properties": {}}}
 )
 
+        if reg.memory:
+            r.register("save_memory", lambda a, _: reg.memory.save_memory(a["name"], a["description"], a["type"], a["content"]),
+                        {"name": "save_memory", "description": "Save a memory.",
+                         "input_schema": {"type": "object", "properties": {
+                             "name": {"type": "string"}, "description": {"type": "string"},
+                             "type": {"type": "string", "enum": ["user", "feedback", "project", "reference"]},
+                             "content": {"type": "string"}}, "required": ["name", "description", "type", "content"]}})
 
-def backoff_delay(attempt: int) -> float:
-    d = min(BACKOFF_BASE_DELAY * (2 ** attempt), BACKOFF_MAX_DELAY)
-    return d + random.uniform(0, 1)
+        if reg.tasks:
+            r.register("task_create", lambda a, _: reg.tasks.create(a["subject"], a.get("description", "")),
+                        {"name": "task_create", "description": "Create task.",
+                         "input_schema": {"type": "object", "properties": {"subject": {"type": "string"}, "description": {"type": "string"}}, "required": ["subject"]}})
+            r.register("task_update", lambda a, _: reg.tasks.update(a["task_id"], a.get("status"), a.get("owner")),
+                        {"name": "task_update", "description": "Update task.",
+                         "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "deleted"]}, "owner": {"type": "string"}}, "required": ["task_id"]}})
+            r.register("task_list",   lambda a, _: reg.tasks.list_all(),
+                        {"name": "task_list", "description": "List tasks.",
+                         "input_schema": {"type": "object", "properties": {}}})
+            r.register("task_get",    lambda a, _: reg.tasks.get(a["task_id"]),
+                        {"name": "task_get", "description": "Get task.",
+                         "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}})
 
+        if reg.cron:
+            def cron_create(a, _): return reg.cron.create(a["cron"], a["prompt"], a.get("recurring", True), a.get("durable", False))
+            r.register("cron_create", cron_create,
+                        {"name": "cron_create", "description": "Schedule task.",
+                         "input_schema": {"type": "object", "properties": {"cron": {"type": "string"}, "prompt": {"type": "string"}, "recurring": {"type": "boolean"}, "durable": {"type": "boolean"}}, "required": ["cron", "prompt"]}})
+            r.register("cron_delete", lambda a, _: reg.cron.delete(a["id"]),
+                        {"name": "cron_delete", "description": "Delete cron.",
+                         "input_schema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}})
+            r.register("cron_list",   lambda a, _: reg.cron.list_tasks(),
+                        {"name": "cron_list", "description": "List crons.",
+                         "input_schema": {"type": "object", "properties": {}}})
 
-def do_auto_compact(client, model: str, messages: list) -> list:
-    text = json.dumps(messages, default=str)[:80000]
-    prompt = (
-        "Summarize this coding-agent conversation for continuity.\n"
-        "Preserve: goal, current state, files touched, decisions, remaining work.\n\n" + text
-    )
-    try:
-        r = client.messages.create(model=model, messages=[{"role": "user", "content": prompt}], max_tokens=4000)
-        summary = r.content[0].text
-    except Exception as e:
-        summary = f"(compact failed: {e})"
-    return [{"role": "user", "content": (
-        "This session continues from a prior compacted conversation.\n\n"
-        f"Summary:\n{summary}\n\nContinue from where we left off."
-    )}]
+        if reg.background:
+            r.register("background_run",   lambda a, _: reg.background.run(a["command"]),
+                        {"name": "background_run", "description": "Run in background.",
+                         "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}})
+            r.register("check_background", lambda a, _: reg.background.check(a.get("task_id")),
+                        {"name": "check_background", "description": "Check background task.",
+                         "input_schema": {"type": "object", "properties": {"task_id": {"type": "string"}}}})
 
+        if reg.todo:
+            r.register("plan_update", lambda a, _: reg.todo.update(a["items"]),
+                        {"name": "plan_update", "description": "Update plan.",
+                         "input_schema": {"type": "object", "properties": {"items": {"type": "array"}}, "required": ["items"]}}
+)
 
-# ---------------------------------------------------------------------------
-# Main agent loop
-# ---------------------------------------------------------------------------
-def run_agent_loop(
-    system_prompt: str,
-    registry: AgentRegistry,
-    max_tokens_per_call: int = 8000,
-) -> None:
-    """
-    Unified interactive agent loop.
+    def _ctx(self) -> dict:
+        return {"workdir": self.registry.workdir, "compact": self._compact_state}
 
-    Args:
-        system_prompt: Base system prompt for the agent.
-        registry: AgentRegistry with all capability instances.
-        max_tokens_per_call: Max tokens per API call.
-    """
-    tools = build_tools(registry)
-    history: list = []
-    max_output_recovery_count = 0
-
-    def build_system() -> str:
-        parts = [system_prompt]
-        if registry.skills:
-            parts.append(f"\nAvailable skills:\n{registry.skills.describe_available()}")
-        if registry.memory:
-            ms = registry.memory.load_memory_prompt()
-            if ms:
-                parts.append(f"\n{ms}")
+    def _build_system(self) -> str:
+        parts = [self.system_prompt]
+        if self.registry.skills:
+            parts.append("\nAvailable skills:\n" + self.registry.skills.describe_available())
+        if self.registry.memory:
+            ms = self.registry.memory.load_memory_prompt()
+            if ms: parts.append("\n" + ms)
         return "\n\n".join(parts)
 
-    while True:
-        # Drain cron notifications
-        if registry.cron:
-            for note in registry.cron.drain_notifications():
-                print(f"[Cron] {note[:100]}")
-                history.append({"role": "user", "content": note})
+    def _compact_history(self, history: list) -> list:
+        from capabilities.compact import compact_history
+        return compact_history(self._client, self.model, history, self._compact_state)
 
-        # Drain background task notifications
-        if registry.background:
-            for n in registry.background.drain_notifications():
-                history.append({"role": "user", "content": f"[bg:{n['task_id']}] {n['status']}: {n['preview']}"})
-
-        # Drain inbox messages (multi-agent)
-        if registry.message_bus:
-            inbox = registry.message_bus.read_inbox("lead")
-            for msg in inbox:
-                history.append({"role": "user", "content": f"<inbox>{json.dumps(msg)}</inbox>"})
-
-        # Proactive context size check
-        if registry.compact and estimate_context_size(history) > TOKEN_THRESHOLD:
-            print("[auto compact]")
-            history[:] = compact_history(_client, MODEL, history, registry.compact)
-
-        # Fire SessionStart hooks
-        if registry.hooks:
-            registry.hooks.run_hooks("SessionStart", {})
-
-        # --- API call with recovery ---
-        response = None
-        for attempt in range(MAX_RECOVERY_ATTEMPTS + 1):
-            try:
-                response = _client.messages.create(
-                    model=MODEL,
-                    system=build_system(),
-                    messages=normalize_messages(history),
-                    tools=tools,
-                    max_tokens=max_tokens_per_call,
-                )
-                break
-            except APIError as e:
-                err = str(e).lower()
-                if "overlong_prompt" in err or ("prompt" in err and "long" in err):
+    def _call_api(self, tools: list, history: list, attempt: int = 0):
+        backoff = min(1.0 * (2 ** attempt), 30.0) + random.uniform(0, 1)
+        try:
+            return self._client.messages.create(
+                model=self.model,
+                system=self._build_system(),
+                messages=normalize_messages(history),
+                tools=tools,
+                max_tokens=self.max_tokens,
+            )
+        except APIError as e:
+            err = str(e).lower()
+            if "overlong" in err or ("prompt" in err and "long" in err):
+                if attempt < 2:
                     print("[Recovery] Prompt too long, compacting...")
-                    history[:] = do_auto_compact(_client, MODEL, history)
-                    continue
-                if attempt < MAX_RECOVERY_ATTEMPTS:
-                    d = backoff_delay(attempt)
-                    print(f"[Recovery] API error: {e}. Retrying in {d:.1f}s...")
-                    time.sleep(d)
-                    continue
-                print(f"[Error] API failed after {MAX_RECOVERY_ATTEMPTS} retries: {e}")
+                    history[:] = self._compact_history(history)
+                    return self._call_api(tools, history, attempt + 1)
+            if attempt < 3:
+                print("[Recovery] API error: %s. Retrying in %.1fs..." % (e, backoff))
+                time.sleep(backoff)
+                return self._call_api(tools, history, attempt + 1)
+            print("[Error] API failed: %s" % e)
+            return None
+        except (ConnectionError, TimeoutError, OSError) as e:
+            if attempt < 3:
+                print("[Recovery] Connection error: %s. Retrying in %.1fs..." % (e, backoff))
+                time.sleep(backoff)
+                return self._call_api(tools, history, attempt + 1)
+            print("[Error] Connection failed: %s" % e)
+            return None
+
+    def run(self) -> None:
+        tools = self.router.tools_for_llm()
+        history = []
+        max_tokens_recovery = 0
+
+        while True:
+            # 1. drain 外部事件
+            for src in self._sources:
+                for msg in src.drain():
+                    history.append(msg)
+
+            # 2. 上下文超限则压缩
+            if self._compact_state:
+                from capabilities.compact import estimate_context_size
+                if estimate_context_size(history) > 50000:
+                    print("[auto compact]")
+                    history[:] = self._compact_history(history)
+
+            # 3. SessionStart 钩子
+            if self.registry.hooks:
+                self.registry.hooks.run_hooks("SessionStart", {})
+
+            # 4. API 调用
+            response = self._call_api(tools, history)
+            if response is None:
                 return
-            except (ConnectionError, TimeoutError, OSError) as e:
-                if attempt < MAX_RECOVERY_ATTEMPTS:
-                    d = backoff_delay(attempt)
-                    print(f"[Recovery] Connection error: {e}. Retrying in {d:.1f}s...")
-                    time.sleep(d)
+
+            history.append({"role": "assistant", "content": response.content})
+
+            # 5. max_tokens 恢复
+            if response.stop_reason == "max_tokens":
+                max_tokens_recovery += 1
+                if max_tokens_recovery <= 3:
+                    history.append({"role": "user", "content": "Output limit hit. Continue directly from where you stopped."})
                     continue
-                print(f"[Error] Connection failed: {e}")
-                return
-
-        if response is None:
-            print("[Error] No response received.")
-            return
-
-        history.append({"role": "assistant", "content": response.content})
-
-        # max_tokens recovery
-        if response.stop_reason == "max_tokens":
-            max_output_recovery_count += 1
-            if max_output_recovery_count <= MAX_RECOVERY_ATTEMPTS:
-                print(f"[Recovery] max_tokens hit ({max_output_recovery_count}/{MAX_RECOVERY_ATTEMPTS}).")
-                history.append({"role": "user", "content": CONTINUATION_MESSAGE})
-                continue
-            else:
                 print("[Error] max_tokens recovery exhausted.")
                 return
-        max_output_recovery_count = 0
+            max_tokens_recovery = 0
 
-        if response.stop_reason != "tool_use":
-            # Print final text
-            final = extract_text(history[-1]["content"])
-            if final:
-                print(final)
-            return
+            # 6. 非工具调用 -> 打印文本，结束
+            if response.stop_reason != "tool_use":
+                text = extract_text(history[-1]["content"])
+                if text:
+                    print(text)
+                return
 
-        # --- Process tool calls ---
-        results = []
-        for block in response.content:
-            if block.type != "tool_use":
-                continue
+            # 7. 处理工具调用 (pre -> dispatch -> post)
+            results = []
+            for block in response.content:
+                if block.type != "tool_use":
+                    continue
 
-            tool_input = dict(block.input or {})
+                tool_input = dict(block.input or {})
 
-            # Permission check
-            if registry.permissions:
-                decision = registry.permissions.check(block.name, tool_input)
-                if decision["behavior"] == "deny":
-                    output = f"Permission denied: {decision['reason']}"
-                    print(f"  [DENIED] {block.name}")
-                elif decision["behavior"] == "ask":
-                    if not registry.permissions.ask_user(block.name, tool_input):
-                        output = f"Permission denied by user for {block.name}"
-                        print(f"  [USER DENIED] {block.name}")
-                    else:
-                        output = execute_tool(block.name, tool_input, registry, block.id)
-                else:
-                    output = execute_tool(block.name, tool_input, registry, block.id)
-            else:
-                output = execute_tool(block.name, tool_input, registry, block.id)
+                # 控制面 pre
+                pre = self.plane.pre_tool(block.name, tool_input)
+                for msg in pre.injected_messages:
+                    results.append({"type": "tool_result", "tool_use_id": block.id, "content": msg})
 
-            # PreToolUse hooks
-            if registry.hooks:
-                ctx = {"tool_name": block.name, "tool_input": tool_input}
-                pre = registry.hooks.run_hooks("PreToolUse", ctx)
-                for msg in pre.get("messages", []):
-                    results.append({"type": "tool_result", "tool_use_id": block.id,
-                                  "content": f"[Hook]: {msg}"})
-                if pre.get("blocked"):
-                    results.append({"type": "tool_result", "tool_use_id": block.id,
-                                  "content": f"Blocked: {pre.get('block_reason', '')}"})
+                if pre.blocked:
+                    results.append({"type": "tool_result", "tool_use_id": block.id, "content": pre.output or ""})
                     history.append({"role": "user", "content": results})
                     return
 
-            print(f"> {block.name}: {str(output)[:200]}")
+                if pre.output:
+                    results.append({"type": "tool_result", "tool_use_id": block.id, "content": pre.output})
+                    continue
 
-            # PostToolUse hooks
-            if registry.hooks:
-                ctx["tool_output"] = output
-                post = registry.hooks.run_hooks("PostToolUse", ctx)
-                for msg in post.get("messages", []):
-                    output = f"{output}\n[Hook note]: {msg}"
+                # 分发
+                output = self.router.dispatch(block.name, tool_input, self._ctx())
+                print("> %s: %s" % (block.name, str(output)[:200]))
 
-            results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+                # 控制面 post
+                output = self.plane.post_tool(block.name, tool_input, output)
 
-        history.append({"role": "user", "content": results})
+                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
 
-        # Print assistant text
-        final = extract_text(history[-1]["content"])
-        if final:
-            print(final)
+            history.append({"role": "user", "content": results})
+
+            # 打印 assistant 文本
+            text = extract_text(history[-1]["content"])
+            if text:
+                print(text)
