@@ -70,6 +70,16 @@ AGENT_REPO_ROOT=/path/to/repo   # git worktree 功能需要
 | `--worktrees` | Git worktree 管理（需 git 仓库） |
 | `--multiagent` | 多智能体通信总线 |
 
+## 更新记录
+
+| Commit | 描述 |
+|--------|------|
+| `d61a9ff` | 重构 agent_loop：分离 ControlPlane 和 ToolRouter，消除散落的 if 链 |
+| `edc08d4` | 删除 sessions/ 目录（教学演示文件不需要在主仓库） |
+| `e59a05b` | 更新 README：移除 sessions 相关描述 |
+| `e053785` | 移除 sessions/ 目录 |
+| `a532294` | 初始提交：19个教学 session 集成的编程智能体 |
+
 ## 设计原则
 
 1. **可组合** — 统一入口让你按需选择能力，无需全部加载
