@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from dotenv import load_dotenv
-load_dotenv(dotenv_path=DOTENV, override=True)
+load_dotenv(dotenv_path=r"C:\Users\10621\Desktop\code_source\agent_code\.env", override=True)
 
 from anthropic import Anthropic, APIError
 from infra.base import extract_text, normalize_messages, read_file, run_bash, write_file, edit_file
