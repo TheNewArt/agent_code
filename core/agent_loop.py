@@ -299,8 +299,6 @@ class AgentRunner:
 
     def _call_api(self, tools: list, history: list, attempt: int = 0):
         backoff = min(1.0 * (2 ** attempt), 30.0) + random.uniform(0, 1)
-        norm_msgs = normalize_messages(history)
-        print("[DEBUG] messages to send: %d" % len(norm_msgs))
         try:
             return self._client.messages.create(
                 model=self.model,
