@@ -1,110 +1,78 @@
-# Agent Code — 19-Session Teaching Project
+# Agent Code
 
-An integrated coding agent built from 19 progressive teaching sessions, covering everything from a minimal agent loop to multi-agent teams with git worktrees and MCP plugin support.
+一个功能完整的 AI 编程智能体，支持可组合的能力模块：技能系统、持久记忆、权限管理、钩子系统、上下文压缩、任务看板、Cron 调度、后台任务、多智能体协作、Git Worktree 和 MCP 插件。
 
-## Project Structure
+## 项目结构
 
 ```
 agent_code/
-├── unified_agent.py          ← Main entry point (all capabilities composable)
-├── README.md
+├── unified_agent.py          ← 主入口（所有能力可按需开启）
+├── .env                      ← API 配置（API Key 和中转地址）
 ├── infra/
-│   └── base.py              ← safe_path, run_bash, read/write/edit, normalize_messages
-├── capabilities/
-│   ├── background.py        ← Background thread execution + notification queue
-│   ├── compact.py           ← Context compaction + transcript persistence
-│   ├── hooks.py             ← PreToolUse / PostToolUse / SessionStart hooks
-│   ├── memory.py            ← Persistent cross-session memory (frontmatter .md files)
-│   ├── permissions.py       ← Permission modes: default / plan / auto
-│   ├── scheduler.py         ← Cron-based background task scheduler
-│   ├── skills.py            ← Skill registry (loads from skills/ directory)
-│   ├── tasks.py             ← Persistent shared task board (CRUD)
-│   └── todo.py              ← Session-level plan tracker
-├── multiagent/
-│   ├── message_bus.py       ← JSONL inbox per agent (all comms go here)
-│   ├── worktree_manager.py  ← Git worktree lifecycle + task binding + event log
-│   └── mcp_client.py        ← MCP stdio client + PluginLoader + MCToolRouter
-├── core/
-│   └── agent_loop.py        ← Unified agent loop (all capabilities integrated)
-└── sessions/
-    ├── s01.py  ← Minimal agent loop (bash only)
-    ├── s02.py  ← Base tools: bash, read, write, edit + message normalization
-    ├── s03.py  ← Todo / plan manager (session-level)
-    ├── s04.py  ← Subagent / task delegation (background threads)
-    ├── s05.py  ← Skills system (SKILL.md registry)
-    ├── s06.py  ← Context compaction + large output persistence
-    ├── s07.py  ← Permission modes (default / plan / auto)
-    ├── s08.py  ← Hook system (PreToolUse, PostToolUse, SessionStart)
-    ├── s09.py  ← Memory manager (persistent across sessions)
-    ├── s10.py  ← System prompt builder (dynamic assembly)
-    ├── s11.py  ← Error recovery (max_tokens, prompt_too_long, backoff)
-    ├── s12.py  ← Task manager (persistent task board)
-    ├── s13.py  ← Background manager (threaded tasks + notification queue)
-    ├── s14.py  ← Cron scheduler (background scheduled tasks)
-    ├── s15.py  ← Multi-agent: message bus + team spawning
-    ├── s16.py  ← + Shutdown protocol + plan approval
-    ├── s17.py  ← + Autonomous teammates (idle/polling + task claiming)
-    ├── s18.py  ← + Git worktree management + task binding
-    └── s19.py  ← + MCP client + plugin loader + permission gate
+│   └── base.py              ← 公共基础：safe_path, bash安全, 读写编辑, 消息归一化
+├── capabilities/            ← 9个可插拔能力模块
+│   ├── background.py        ← 后台线程执行 + 通知队列
+│   ├── compact.py           ← 上下文压缩 + 转录持久化
+│   ├── hooks.py             ← PreToolUse / PostToolUse / SessionStart 钩子
+│   ├── memory.py            ← 跨会话持久记忆
+│   ├── permissions.py       ← 权限模式：default / plan / auto
+│   ├── scheduler.py         ← Cron 定时调度
+│   ├── skills.py            ← 技能注册表（从 skills/ 目录加载）
+│   ├── tasks.py             ← 持久任务看板
+│   └── todo.py              ← 会话级计划追踪
+├── multiagent/             ← 多智能体基础设施
+│   ├── message_bus.py       ← JSONL 收件箱通信总线
+│   ├── worktree_manager.py ← Git worktree 生命周期 + 任务绑定
+│   └── mcp_client.py       ← MCP stdio 客户端 + 插件加载器
+└── core/
+    └── agent_loop.py        ← 统一 Agent 循环（所有能力整合）
 ```
 
-## Quick Start
+## 快速开始
 
 ```bash
-# Minimal (just the base loop)
+cd agent_code
+
+# 最小运行（仅 base loop）
 python unified_agent.py
 
-# Full capabilities
+# 开启全部能力
 python unified_agent.py --all
 
-# Specific capabilities
+# 按需开启特定能力
 python unified_agent.py --skills --memory --tasks --cron
-
-# Run a single session
-python sessions/s03.py
 ```
 
-## Environment Variables
+## 环境变量
 
 ```bash
+# .env 文件中配置
+ANTHROPIC_API_KEY=your-api-key
+ANTHROPIC_BASE_URL=https://your-proxy/v1   # 中转地址
 MODEL_ID=claude-sonnet-4-20250514
-ANTHROPIC_BASE_URL=https://api.example.com/v1  # optional custom endpoint
 AGENT_WORKDIR=/path/to/project
-AGENT_REPO_ROOT=/path/to/repo  # for git worktree features
+AGENT_REPO_ROOT=/path/to/repo   # git worktree 功能需要
 ```
 
-## Capability Reference
+## 能力参考
 
-| Flag | What it adds |
-|------|-------------|
-| `--skills` | `load_skill` + `skills_list` — load skill definitions from `skills/` |
-| `--memory` | `save_memory` — persistent cross-session memories |
-| `--tasks` | `task_create/update/list/get` — shared task board |
-| `--cron` | `cron_create/delete/list` — scheduled background tasks |
-| `--background` | `background_run/check_background` — non-blocking threads |
-| `--todo` | `plan_update` — session-level plan tracker |
-| `--hooks` | `PreToolUse/PostToolUse/SessionStart` — hook system |
-| `--permissions` | Permission modes: default / plan / auto |
-| `--compact` | Auto context compaction + transcript persistence |
-| `--worktrees` | Git worktree create/run/keep/remove + task binding |
-| `--multiagent` | Message bus for multi-agent communication |
+| 标志 | 功能 |
+|------|------|
+| `--skills` | 技能注册表，从 `skills/` 加载 SKILL.md |
+| `--memory` | 跨会话持久记忆 |
+| `--tasks` | 共享任务看板（CRUD） |
+| `--cron` | 定时调度任务 |
+| `--background` | 后台线程执行 |
+| `--todo` | 会话级计划追踪 |
+| `--hooks` | PreToolUse / PostToolUse / SessionStart 钩子 |
+| `--permissions` | 权限模式：default / plan / auto |
+| `--compact` | 自动上下文压缩 + 转录持久化 |
+| `--worktrees` | Git worktree 管理（需 git 仓库） |
+| `--multiagent` | 多智能体通信总线 |
 
-## Sessions Summary
+## 设计原则
 
-Each `sNN.py` is a standalone, runnable agent demonstrating one lesson.
-They build progressively: later sessions import concepts from earlier ones.
-
-- **s01–s02**: Core loop + base tools
-- **s03–s04**: Plan tracking + subagent delegation
-- **s05–s07**: Skills, compaction, permissions
-- **s08–s10**: Hooks, memory, prompt assembly
-- **s11–s14**: Error recovery, task board, background, cron
-- **s15–s17**: Multi-agent: message bus, protocols, autonomous teammates
-- **s18–s19**: Git worktrees, MCP plugins
-
-## Design Principles
-
-1. **Teaching-first** — Each session isolates one concept clearly
-2. **Composable** — The unified agent lets you pick exactly which capabilities you need
-3. **No magic** — All infrastructure is visible and editable plain Python
-4. **Persistence by default** — State survives sessions (tasks, memory, cron, hooks configs)
+1. **可组合** — 统一入口让你按需选择能力，无需全部加载
+2. **无魔法** — 所有基础设施都是可见的纯 Python
+3. **默认持久化** — 任务、记忆、调度、钩子配置都持久化到磁盘
+4. **教学导向** — 原始 19 个教学 session 文件在源码中清晰展示每个概念的演进
