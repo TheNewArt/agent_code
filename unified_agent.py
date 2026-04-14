@@ -83,9 +83,6 @@ def build_registry(args: argparse.Namespace) -> AgentRegistry:
         worktrees=WorktreeManager(Path(os.getenv("AGENT_REPO_ROOT", workdir))) if args.worktrees else None,
         message_bus=MessageBus(workdir / ".team" / "inbox") if args.multiagent else None,
         workdir=workdir,
-        skill_dir=workdir / "skills",
-        memory_dir=workdir / ".memory",
-        tasks_dir=workdir / ".tasks",
     )
 
 
