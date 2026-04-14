@@ -75,3 +75,30 @@ AGENT_REPO_ROOT=/path/to/repo   # git worktree 功能需要
 1. **可组合** — 统一入口让你按需选择能力，无需全部加载
 2. **无魔法** — 所有基础设施都是可见的纯 Python
 3. **默认持久化** — 任务、记忆、调度、钩子配置都持久化到磁盘
+
+## 架构设计
+
+```
+API 返回 tool_use
+        ↓
+ControlPlane.pre_tool()    ← 权限判断 + PreToolUse 钩子（统一入口）
+        ↓
+ToolRouter.dispatch()      ← 工具分发，零 if，靠注册表驱动
+        ↓
+ControlPlane.post_tool()   ← PostToolUse 钩子（统一入口）
+```
+
+**三层边界，各自单一职责：**
+
+| 组件 | 职责 |
+|------|------|
+| `ControlPlane` | 权限检查（deny/ask/allow）+ Pre/Post 钩子拦截 |
+| `ToolRouter` | 注册 → 分发，零 if 判断，靠 `router.dispatch(name, args, ctx)` 执行 |
+| `EventSource` | cron / background / message_bus 视为外部事件，主循环只 drain 并注入 history |
+
+**主循环 `AgentRunner.run()` 干净如上，仅含：**
+- drain 外部事件
+- 上下文压缩检查
+- API 调用 + 错误恢复
+- max_tokens 恢复
+- 工具块处理（统一 pre → dispatch → post，无 if 侵入）
