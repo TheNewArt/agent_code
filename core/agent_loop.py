@@ -411,3 +411,8 @@ class AgentRunner:
             text = extract_text(history[-1]["content"])
             if text:
                 print(text)
+
+
+# 兼容性别名（unified_agent.py 用的是这个名字）
+def run_agent_loop(system_prompt: str, registry: AgentRegistry, max_tokens: int = 8000) -> None:
+    AgentRunner(system_prompt, registry, max_tokens).run()
