@@ -20,12 +20,12 @@ agent_code/
 │   ├── skills.py            ← 技能注册表（从 skills/ 目录加载）
 │   ├── tasks.py             ← 持久任务看板
 │   └── todo.py              ← 会话级计划追踪
-├── multiagent/             ← 多智能体基础设施
+├── multiagent/              ← 多智能体基础设施
 │   ├── message_bus.py       ← JSONL 收件箱通信总线
-│   ├── worktree_manager.py ← Git worktree 生命周期 + 任务绑定
-│   └── mcp_client.py       ← MCP stdio 客户端 + 插件加载器
+│   ├── worktree_manager.py  ← Git worktree 生命周期 + 任务绑定
+│   └── mcp_client.py        ← MCP stdio 客户端 + 插件加载器
 └── core/
-    └── agent_loop.py        ← 统一 Agent 循环（所有能力整合）
+    └── agent_loop.py         ← 统一 Agent 循环（所有能力整合）
 ```
 
 ## 快速开始
@@ -75,4 +75,3 @@ AGENT_REPO_ROOT=/path/to/repo   # git worktree 功能需要
 1. **可组合** — 统一入口让你按需选择能力，无需全部加载
 2. **无魔法** — 所有基础设施都是可见的纯 Python
 3. **默认持久化** — 任务、记忆、调度、钩子配置都持久化到磁盘
-4. **教学导向** — 原始 19 个教学 session 文件在源码中清晰展示每个概念的演进
