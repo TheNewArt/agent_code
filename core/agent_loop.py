@@ -199,6 +199,14 @@ class AgentRunner:
         self.model = os.getenv("MODEL_ID", "claude-sonnet-4-20250514")
         self.base_url = os.getenv("ANTHROPIC_BASE_URL", "")
         self._client = Anthropic(base_url=self.base_url) if self.base_url else Anthropic()
+        self._consecutive_empty = 0
+
+    def _reset_client(self):
+        """Recreate the HTTP client after consecutive empty responses."""
+        old_client = self._client
+        self._client = Anthropic(base_url=self.base_url) if self.base_url else Anthropic()
+        self._consecutive_empty = 0
+        print("[API] Client reset due to consecutive empty responses.", flush=True)
         self._compact_state = registry.compact
 
         self.router = ToolRouter()
@@ -314,8 +322,12 @@ class AgentRunner:
             )
             if response is not None:
                 if response.content is None and response.stop_reason is None:
-                    print("[API] WARNING: empty response (stop_reason=None, content=None). Treating as API error.", flush=True)
+                    self._consecutive_empty += 1
+                    print(f"[API] WARNING: empty response ({self._consecutive_empty}/3). Treating as API error.", flush=True)
+                    if self._consecutive_empty >= 3:
+                        self._reset_client()
                     return None
+            self._consecutive_empty = 0
             return response
         except APIError as e:
             err = str(e).lower()

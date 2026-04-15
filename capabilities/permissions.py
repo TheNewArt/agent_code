@@ -123,6 +123,9 @@ class PermissionManager:
             answer = input("  Allow? (y/n/always/abort): ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             return False
+        # Empty input defaults to y (approve)
+        if answer == "":
+            answer = "y"
         # Commands that abort the current task without denying permanently
         if answer in ("skip", "s", "q", "quit", "exit", "--skip", "--plan"):
             print("  [Permission] Skipped.")
