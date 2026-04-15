@@ -97,29 +97,37 @@ def edit_file(path_str: str, old_text: str, new_text: str, workdir: Path | None 
         return f"Error: {e}"
 
 
+def _to_dict(obj):
+    """Convert Pydantic models or dicts to plain dicts, strip private fields."""
+    if isinstance(obj, dict):
+        return {k: v for k, v in obj.items() if not k.startswith("_")}
+    if hasattr(obj, "model_dump"):          # Pydantic v2
+        return {k: v for k, v in obj.model_dump().items() if not k.startswith("_")}
+    if hasattr(obj, "as_dict"):             # Pydantic v1
+        return {k: v for k, v in obj.as_dict().items() if not k.startswith("_")}
+    return obj
+
 def normalize_messages(messages: list) -> list:
     """
     Clean up messages before sending to the API.
     - Strip internal metadata fields
-    - Ensure every tool_use has a matching tool_result
-    - Merge consecutive same-role messages
+    - Ensure every tool_use has a matching tool_result (idempotent: placeholders only added once)
+    - Merge consecutive same-role TEXT-ONLY messages (blocks are never merged)
     """
     cleaned = []
     for msg in messages:
         clean = {"role": msg["role"]}
-        if isinstance(msg.get("content"), str):
-            clean["content"] = msg["content"]
-        elif isinstance(msg.get("content"), list):
-            clean["content"] = [
-                {k: v for k, v in block.items() if not k.startswith("_")}
-                for block in msg["content"]
-                if isinstance(block, dict)
-            ]
+        raw_content = msg.get("content")
+        if isinstance(raw_content, str):
+            clean["content"] = raw_content
+        elif isinstance(raw_content, list):
+            blocks = [_to_dict(b) for b in raw_content if _to_dict(b) is not None]
+            clean["content"] = blocks
         else:
-            clean["content"] = msg.get("content", "")
+            clean["content"] = raw_content if raw_content is not None else ""
         cleaned.append(clean)
 
-    # Insert placeholder tool_result for orphaned tool_use blocks
+    # Insert placeholder tool_result for orphaned tool_use blocks (idempotent)
     existing_results = set()
     for msg in cleaned:
         if isinstance(msg.get("content"), list):
@@ -132,24 +140,31 @@ def normalize_messages(messages: list) -> list:
             continue
         for block in msg["content"]:
             if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("id") not in existing_results:
+                # Mark this tool_use id so we don't add a second placeholder on re-normalize
+                existing_results.add(block.get("id"))
                 cleaned.append({"role": "user", "content": [
                     {"type": "tool_result", "tool_use_id": block["id"], "content": "(cancelled)"}
                 ]})
 
-    # Merge consecutive same-role messages
+    # Merge consecutive same-role TEXT-ONLY messages (blocks are never merged)
     if not cleaned:
         return cleaned
     merged = [cleaned[0]]
     for msg in cleaned[1:]:
         if msg["role"] == merged[-1]["role"]:
-            prev = merged[-1]
-            prev_c = prev["content"] if isinstance(prev["content"], list) \
-                else [{"type": "text", "text": str(prev["content"])}]
-            curr_c = msg["content"] if isinstance(msg["content"], list) \
-                else [{"type": "text", "text": str(msg["content"])}]
-            prev["content"] = prev_c + curr_c
-        else:
-            merged.append(msg)
+            prev_c = merged[-1]["content"]
+            curr_c = msg["content"]
+            prev_is_text = isinstance(prev_c, str) or (
+                isinstance(prev_c, list) and len(prev_c) == 0
+            )
+            curr_is_text = isinstance(curr_c, str) or (
+                isinstance(curr_c, list) and len(curr_c) == 0
+            )
+            if prev_is_text and curr_is_text:
+                # Both text-only: merge string content
+                merged[-1]["content"] = str(prev_c) + "\n" + str(curr_c)
+                continue
+        merged.append(msg)
     return merged
 
 

@@ -297,34 +297,44 @@ class AgentRunner:
         from capabilities.compact import compact_history
         return compact_history(self._client, self.model, history, self._compact_state)
 
-    def _call_api(self, tools: list, history: list, attempt: int = 0):
+    def _call_api(self, tools: list, history: list, attempt: int = 0, _norm_cache: list = None):
         backoff = min(1.0 * (2 ** attempt), 30.0) + random.uniform(0, 1)
+        system = self._build_system()
+        # Normalize once; reuse cached result on retries to avoid placeholder injection duplication
+        if _norm_cache is None:
+            _norm_cache = normalize_messages(history)
+        norm_messages = _norm_cache
         try:
-            return self._client.messages.create(
+            response = self._client.messages.create(
                 model=self.model,
-                system=self._build_system(),
-                messages=normalize_messages(history),
+                system=system,
+                messages=norm_messages,
                 tools=tools,
                 max_tokens=self.max_tokens,
             )
+            if response is not None:
+                if response.content is None and response.stop_reason is None:
+                    print("[API] WARNING: empty response (stop_reason=None, content=None). Treating as API error.", flush=True)
+                    return None
+            return response
         except APIError as e:
             err = str(e).lower()
             if "overlong" in err or ("prompt" in err and "long" in err):
                 if attempt < 2:
                     print("[Recovery] Prompt too long, compacting...")
                     history[:] = self._compact_history(history)
-                    return self._call_api(tools, history, attempt + 1)
+                    return self._call_api(tools, history, attempt + 1, _norm_cache)
             if attempt < 3:
                 print("[Recovery] API error: %s. Retrying in %.1fs..." % (e, backoff))
                 time.sleep(backoff)
-                return self._call_api(tools, history, attempt + 1)
+                return self._call_api(tools, history, attempt + 1, _norm_cache)
             print("[Error] API failed: %s" % e)
             return None
         except (ConnectionError, TimeoutError, OSError) as e:
             if attempt < 3:
                 print("[Recovery] Connection error: %s. Retrying in %.1fs..." % (e, backoff))
                 time.sleep(backoff)
-                return self._call_api(tools, history, attempt + 1)
+                return self._call_api(tools, history, attempt + 1, _norm_cache)
             print("[Error] Connection failed: %s" % e)
             return None
 

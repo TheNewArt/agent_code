@@ -126,9 +126,11 @@ def main() -> None:
             break
 
         history.append({"role": "user", "content": query})
+        print("[DEBUG history.len=%d]" % len(history))
 
         # 单轮：构建工具列表 -> API 调用 -> 处理结果
         tools = runner.router.tools_for_llm()
+        print("[DEBUG tools_count=%d]" % len(tools))
 
         # drain 事件
         for src in runner._sources:
@@ -143,9 +145,19 @@ def main() -> None:
 
         history.append({"role": "assistant", "content": response.content})
 
-        if response.stop_reason != "tool_use":
+        if response.stop_reason == "max_tokens":
+            history.append({"role": "user", "content": "Output limit hit. Continue directly from where you stopped."})
+            continue
+
+        if response.stop_reason == "max_tokens":
+            history.append({"role": "user", "content": "Output limit hit. Continue directly from where you stopped."})
+            continue
+
+        if response.stop_reason is None or response.stop_reason != "tool_use":
             from infra.base import extract_text
             text = extract_text(history[-1]["content"])
+            if response.stop_reason is None:
+                print("[Error] Model returned empty response (stop_reason=None). Check API logs.", flush=True)
             if text:
                 print(text)
             break
@@ -174,14 +186,78 @@ def main() -> None:
 
             # 分发
             output = runner.router.dispatch(block.name, tool_input, runner._ctx())
-            print("> %s: %s" % (block.name, str(output)[:200]))
+            print("> %s: %s" % (block.name, str(output)[:200]), flush=True)
 
             # 控制面 post
             output = runner.plane.post_tool(block.name, tool_input, output)
             results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
 
         history.append({"role": "user", "content": results})
+        print(f"[inner loop] history.len={len(history)}, draining..." if len(history) > 0 else "", flush=True)
 
+        # 内层循环：工具调用完成后，继续要模型下一个回复
+        retry_count = 0
+        while True:
+            response = runner._call_api(tools, history)
+            if response is None:
+                retry_count += 1
+                error_msg = "[Error] API call failed"
+                if retry_count >= 3:
+                    print(f"{error_msg} (retried {retry_count} times). Try again or restart.", flush=True)
+                    break
+                print(f"{error_msg}, retrying ({retry_count}/3)...", flush=True)
+                continue
+
+            retry_count = 0
+            history.append({"role": "assistant", "content": response.content})
+
+            if response.stop_reason == "max_tokens":
+                history.append({"role": "user", "content": "Output limit hit. Continue directly from where you stopped."})
+                continue
+
+            if response.stop_reason != "tool_use":
+                from infra.base import extract_text
+                text = extract_text(history[-1]["content"])
+                print(f"[stop_reason={response.stop_reason}] text={text!r}", flush=True)
+                if response.stop_reason is None:
+                    print("[Error] Model returned empty response (stop_reason=None). Check API connection.", flush=True)
+                    break
+                if text:
+                    print(text)
+                break  # 文本回复 -> 回外层等 input
+
+            # 处理工具调用
+            results = []
+            for block in response.content:
+                if block.type != "tool_use":
+                    continue
+                print(f"[inner] calling tool: {block.name}", flush=True)
+                tool_input = dict(block.input or {})
+
+                pre = runner.plane.pre_tool(block.name, tool_input)
+                for msg in pre.injected_messages:
+                    results.append({"type": "tool_result", "tool_use_id": block.id, "content": msg})
+
+                if pre.blocked:
+                    results.append({"type": "tool_result", "tool_use_id": block.id, "content": pre.output or ""})
+                    history.append({"role": "user", "content": results})
+                    print("[Blocked] %s" % pre.output)
+                    break
+
+                if pre.output:
+                    results.append({"type": "tool_result", "tool_use_id": block.id, "content": pre.output})
+                    continue
+
+                output = runner.router.dispatch(block.name, tool_input, runner._ctx())
+                print("> %s: %s" % (block.name, str(output)[:200]), flush=True)
+                output = runner.plane.post_tool(block.name, tool_input, output)
+                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+
+            history.append({"role": "user", "content": results})
+            print(f"[inner loop] results processed, history.len={len(history)}", flush=True)
+            # 继续内层循环，等待模型下一轮回复
+
+    # 所有交互循环退出后，停止 cron
     if registry.cron:
         registry.cron.stop()
 
