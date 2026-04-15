@@ -8,8 +8,9 @@
 agent_code/
 ├── unified_agent.py          ← 主入口（所有能力可按需开启）
 ├── .env                      ← API 配置（API Key 和中转地址）
+├── BUGS.md                  ← Bug 追踪文档
 ├── infra/
-│   └── base.py              ← 公共基础：safe_path, bash安全, 读写编辑, 消息归一化
+│   └── base.py             ← 公共基础：safe_path, bash安全, 读写编辑, 消息归一化（含Pydantic兼容）
 ├── capabilities/            ← 9个可插拔能力模块
 │   ├── background.py        ← 后台线程执行 + 通知队列
 │   ├── compact.py           ← 上下文压缩 + 转录持久化
@@ -24,8 +25,23 @@ agent_code/
 │   ├── message_bus.py       ← JSONL 收件箱通信总线
 │   ├── worktree_manager.py  ← Git worktree 生命周期 + 任务绑定
 │   └── mcp_client.py        ← MCP stdio 客户端 + 插件加载器
-└── core/
-    └── agent_loop.py         ← 统一 Agent 循环（所有能力整合）
+├── core/
+│   └── agent_loop.py        ← 统一 Agent 循环（所有能力整合）
+└── tests/                    ← 完整测试套件（142个测试）
+    ├── test_agent_loop.py
+    ├── test_base.py
+    ├── test_skills.py
+    ├── test_memory.py
+    ├── test_tasks.py
+    ├── test_scheduler.py
+    ├── test_background.py
+    ├── test_todo.py
+    ├── test_hooks.py
+    ├── test_permissions.py
+    ├── test_compact.py
+    ├── test_message_bus.py
+    ├── test_worktree_manager.py
+    └── test_mcp_client.py
 ```
 
 ## 快速开始
@@ -74,11 +90,24 @@ AGENT_REPO_ROOT=/path/to/repo   # git worktree 功能需要
 
 | Commit | 描述 |
 |--------|------|
+| `87224d8` | fix: 修复工具调用循环多个严重bug（normalize Pydantic兼容、API错误处理、cron.stop位置）+ 新增142个测试 + BUGS.md |
 | `d61a9ff` | 重构 agent_loop：分离 ControlPlane 和 ToolRouter，消除散落的 if 链 |
 | `edc08d4` | 删除 sessions/ 目录（教学演示文件不需要在主仓库） |
 | `e59a05b` | 更新 README：移除 sessions 相关描述 |
 | `e053785` | 移除 sessions/ 目录 |
 | `a532294` | 初始提交：19个教学 session 集成的编程智能体 |
+
+## 测试
+
+```bash
+# 运行全部测试
+python -m unittest discover -s tests
+
+# 运行指定测试
+python -m unittest tests.test_base -v
+```
+
+**当前覆盖：** 14个测试文件，142个测试，覆盖 core/agent_loop、infra/base、capabilities/*、multiagent/*
 
 ## 设计原则
 
