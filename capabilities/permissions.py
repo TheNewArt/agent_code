@@ -120,8 +120,12 @@ class PermissionManager:
         preview = json.dumps(tool_input, ensure_ascii=False)[:200]
         print(f"\n  [Permission] {tool_name}: {preview}")
         try:
-            answer = input("  Allow? (y/n/always): ").strip().lower()
+            answer = input("  Allow? (y/n/always/abort): ").strip().lower()
         except (EOFError, KeyboardInterrupt):
+            return False
+        # Commands that abort the current task without denying permanently
+        if answer in ("skip", "s", "q", "quit", "exit", "--skip", "--plan"):
+            print("  [Permission] Skipped.")
             return False
         if answer == "always":
             self.rules.append({"tool": tool_name, "path": "*", "behavior": "allow"})
@@ -130,6 +134,9 @@ class PermissionManager:
         if answer in ("y", "yes"):
             self.consecutive_denials = 0
             return True
+        if answer == "abort":
+            print("  [Permission] User requested abort.")
+            raise SystemExit(0)
         self.consecutive_denials += 1
         if self.consecutive_denials >= self.max_consecutive_denials:
             print(f"  [{self.consecutive_denials} consecutive denials -- consider switching to plan mode]")
