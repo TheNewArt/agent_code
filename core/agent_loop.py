@@ -201,14 +201,6 @@ class AgentRunner:
         self._client = Anthropic(base_url=self.base_url) if self.base_url else Anthropic()
         self._consecutive_empty = 0
 
-    def _reset_client(self):
-        """Recreate the HTTP client after consecutive empty responses."""
-        old_client = self._client
-        self._client = Anthropic(base_url=self.base_url) if self.base_url else Anthropic()
-        self._consecutive_empty = 0
-        print("[API] Client reset due to consecutive empty responses.", flush=True)
-        self._compact_state = registry.compact
-
         self.router = ToolRouter()
         self._register_base_tools()
         self._register_capability_tools()
@@ -222,8 +214,13 @@ class AgentRunner:
         if registry.background:  self._sources.append(BackgroundSource(registry.background))
         if registry.message_bus: self._sources.append(InboxSource(registry.message_bus))
 
-        if registry.cron:   registry.cron.start()
-        if registry.memory: registry.memory.load_all()
+        self._compact_state = registry.compact if registry.compact else None
+
+    def _reset_client(self):
+        """Recreate the HTTP client after consecutive empty responses."""
+        self._client = Anthropic(base_url=self.base_url) if self.base_url else Anthropic()
+        self._consecutive_empty = 0
+        print("[API] Client reset due to consecutive empty responses.", flush=True)
 
     def _register_base_tools(self) -> None:
         for t in BASE_TOOLS:
